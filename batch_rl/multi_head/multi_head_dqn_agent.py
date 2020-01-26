@@ -65,6 +65,9 @@ class MultiHeadDQNAgent(dqn_agent.DQNAgent):
     tf.logging.info('\t num_convex_combinations: %d', num_convex_combinations)
     tf.logging.info('\t init_checkpoint_dir: %s', init_checkpoint_dir)
     self.num_heads = num_heads
+    self.network_type = namedtuple('multi_head_DQN_network',
+                        ['q_heads', 'unordered_q_heads', 'q_values'])
+    
     if init_checkpoint_dir is not None:
       self._init_checkpoint_dir = os.path.join(
           init_checkpoint_dir, 'checkpoints')
@@ -75,6 +78,18 @@ class MultiHeadDQNAgent(dqn_agent.DQNAgent):
     self.transform_strategy = transform_strategy
     super(MultiHeadDQNAgent, self).__init__(
         sess, num_actions, network=network, **kwargs)
+    
+  def _create_network(self, name):
+    """Builds the convolutional network used to compute the agent's Q-values.
+    Args:
+      name: str, this name is passed to the tf.keras.Model and used to create
+        variable scope under the hood by the tf.keras.Model.
+    Returns:
+      network: tf.keras.Model, the network instantiated by the Keras model.
+    """
+    network = self.network(self.num_actions, self.num_heads, 
+                           self.network_type, name=name)
+    return network
 
   def _get_network_type(self):
     """Returns the type of the outputs of a Q value network.
@@ -104,14 +119,18 @@ class MultiHeadDQNAgent(dqn_agent.DQNAgent):
     Returns:
       target_q_op: An op calculating the Q-value.
     """
-    # Get the maximum Q-value across the actions dimension for each head.
-    replay_next_qt_max = tf.reduce_max(
-        self._replay_next_target_net_outputs.q_heads, axis=1)
-    is_non_terminal = 1. - tf.cast(self._replay.terminals, tf.float32)
-    is_non_terminal = tf.expand_dims(is_non_terminal, axis=-1)
-    rewards = tf.expand_dims(self._replay.rewards, axis=-1)
-    return rewards + (
-        self.cumulative_gamma * replay_next_qt_max * is_non_terminal)
+    # q_values is the mean of the heads
+    q_values_next = self.online_convnet(self._replay.next_states).q_values
+    best_actions= tf.argmax(q_values_next, axis=1)
+    next_q_heads_target = self.target_convnet(self._replay.next_states).q_heads
+    q_values_next_target = tf.reduce_min(next_q_heads_target, axis=-1)
+    bb = tf.stack([np.arange(best_actions.get_shape().as_list()[0]),
+                   best_actions], axis=-1)
+    x = self._replay.rewards + self.cumulative_gamma * \
+        tf.gather_nd(q_values_next_target, bb) * (
+        1. - tf.cast(self._replay.terminals, tf.float32))
+    x = tf.expand_dims(x, axis=1)
+    return tf.tile(x, [1, self.num_heads])
 
   def _build_train_op(self):
     """Builds a training op.

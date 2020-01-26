@@ -13,132 +13,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helper functions for multi head (Ensemble-DQN and REM) agents."""
-
 import numpy as np
 import tensorflow as tf
 slim = tf.contrib.slim
 
+class multi_head_network(tf.keras.Model):
+  """The convolutional network used to compute the agent's Q-values."""
 
-def multi_head_network(
-    num_actions, num_heads, network_type, state,
-    transform_strategy=None, **kwargs):
-  """The convolutional network used to compute agent's multi-head Q-values.
+  def __init__(self, num_actions, num_heads, network_type, name=None, **kwargs):
+    """Creates the layers used for calculating Q-values.
+    """
+    super(multi_head_network, self).__init__(name=name)
 
-  Args:
-    num_actions: int, number of actions.
-    num_heads: int, the number of buckets of the value function distribution.
-    network_type: namedtuple, collection of expected values to return.
-    state: `tf.Tensor`, contains the agent's current state.
-    transform_strategy: str, Possible options include (1) 'SORT' for sorting
-      the heads, (2) 'ROTATE' for rotating the heads randomly. If None,
-      then the heads are not reordered.
-    **kwargs: Arbitrary keyword arguments.
+    self.num_actions = num_actions
+    self.network_type = network_type
+    self.num_heads = num_heads
+    
+    # Defining layers.
+    activation_fn = tf.keras.activations.relu
+    # Setting names of the layers manually to make variable names more similar
+    # with tf.slim variable names/checkpoints.
+    self.conv1 = tf.keras.layers.Conv2D(32, [8, 8], strides=4, padding='same',
+                                        activation=activation_fn, name='Conv')
+    self.conv2 = tf.keras.layers.Conv2D(64, [4, 4], strides=2, padding='same',
+                                        activation=activation_fn, name='Conv')
+    self.conv3 = tf.keras.layers.Conv2D(64, [3, 3], strides=1, padding='same',
+                                        activation=activation_fn, name='Conv')
+    self.flatten = tf.keras.layers.Flatten()
+    self.dense1 = tf.keras.layers.Dense(512, activation=activation_fn,
+                                        name='fully_connected')
+    self.dense2 = tf.keras.layers.Dense(num_actions*num_heads, 
+      activation=None,
+      name='fully_connected_q_heads')
 
-  Returns:
-    net: _network_type object containing the tensors output by the network.
-  """
-  weights_initializer = slim.variance_scaling_initializer(
-      factor=1.0 / np.sqrt(3.0), mode='FAN_IN', uniform=True)
+  def call(self, state):
+    """Creates the output tensor/op given the state tensor as input.
+    See https://www.tensorflow.org/api_docs/python/tf/keras/Model for more
+    information on this. Note that tf.keras.Model implements `call` which is
+    wrapped by `__call__` function by tf.keras.Model.
+    Parameters created here will have scope according to the `name` argument
+    given at `.__init__()` call.
+    Args:
+      state: Tensor, input tensor.
+    Returns:
+      collections.namedtuple, output ops (graph mode) or output tensors (eager).
+    """
+    x = tf.cast(state, tf.float32)
+    x = tf.div(x, 255.)
+    x = self.conv1(x)
+    x = self.conv2(x)
+    x = self.conv3(x)
+    x = self.flatten(x)
+    x = self.dense1(x)
+    x = self.dense2(x)
 
-  net = tf.cast(state, tf.float32)
-  net = tf.div(net, 255.)
-  net = slim.conv2d(
-      net, 32, [8, 8], stride=4, weights_initializer=weights_initializer)
-  net = slim.conv2d(
-      net, 64, [4, 4], stride=2, weights_initializer=weights_initializer)
-  net = slim.conv2d(
-      net, 64, [3, 3], stride=1, weights_initializer=weights_initializer)
-  net = slim.flatten(net)
-  net = slim.fully_connected(net, 512, weights_initializer=weights_initializer)
-  net = slim.fully_connected(
-      net,
-      num_actions * num_heads,
-      activation_fn=None,
-      weights_initializer=weights_initializer)
+    q_heads = tf.reshape(x, [-1, self.num_actions, self.num_heads])
+    unordered_q_heads = q_heads
+    q_values = tf.reduce_mean(q_heads, axis=-1)
 
-  q_heads = tf.reshape(net, [-1, num_actions, num_heads])
-  unordered_q_heads = q_heads
-
-  q_heads, q_values = combine_q_functions(
-      unordered_q_heads, transform_strategy, **kwargs)
-  return network_type(q_heads, unordered_q_heads, q_values)
-
-
-def combine_q_functions(q_functions, transform_strategy, **kwargs):
-  """Utility function for combining multiple Q functions.
-
-  Args:
-    q_functions: Multiple Q-functions concatenated.
-    transform_strategy: str, Possible options include (1) 'SORT' for sorting
-      the heads, (2) 'ROTATE' for rotating the heads randomly. If None,
-      then the heads are not reordered.
-    **kwargs: Arbitrary keyword arguments.
-  Returns:
-    q_functions: Modified Q-functions.
-    q_values: Q-values based on combining the multiple heads.
-  """
-  # Create q_values before reordering the heads for training
-  q_values = tf.reduce_mean(q_functions, axis=-1)
-
-  if transform_strategy == 'STOCHASTIC':
-    left_stochastic_matrix = kwargs.get('transform_matrix')
-    if left_stochastic_matrix is None:
-      raise ValueError('None value provided for stochastic matrix')
-    q_functions = tf.tensordot(
-        q_functions, left_stochastic_matrix, axes=[[2], [0]])
-  elif transform_strategy == 'IDENTITY':
-    tf.logging.info('Not sorting Q-function heads')
-  else:
-    raise ValueError(
-        '{} is not a valid reordering strategy'.format(transform_strategy))
-  return q_functions, q_values
-
-
-def nature_dqn_network(state, num_actions):
-  """The convolutional network used to compute the agent's Q-values.
-
-  Args:
-    state: `tf.Tensor`, contains the agent's current state.
-    num_actions: int, number of actions.
-
-  Returns:
-    net: _network_type object containing the tensors output by the network.
-  """
-  net = tf.cast(state, tf.float32)
-  net = tf.div(net, 255.)
-  net = tf.contrib.slim.conv2d(net, 32, [8, 8], stride=4)
-  net = tf.contrib.slim.conv2d(net, 64, [4, 4], stride=2)
-  net = tf.contrib.slim.conv2d(net, 64, [3, 3], stride=1)
-  net = tf.contrib.slim.flatten(net)
-  net = tf.contrib.slim.fully_connected(net, 512)
-  q_values = tf.contrib.slim.fully_connected(
-      net, num_actions, activation_fn=None)
-  return q_values
-
-
-def multi_network_dqn(
-    num_actions, num_networks, network_type, state,
-    transform_strategy=None, **kwargs):
-  """Create a Q function using multiple Q-networks."""
-
-  q_networks = []
-  device_fn = kwargs.pop('device_fn', lambda i: '/gpu:0')
-  for i in range(num_networks):
-    with tf.device(device_fn(i)):
-      with tf.variable_scope('network_{}'.format(i)):
-        q_networks.append(nature_dqn_network(state, num_actions))
-  q_networks = tf.stack(q_networks, axis=-1)
-  unordered_q_networks = q_networks
-
-  q_networks, q_values = combine_q_functions(
-      q_networks, transform_strategy, **kwargs)
-  return network_type(q_networks, unordered_q_networks, q_values)
-
-
-def random_stochastic_matrix(dim, num_cols=None, dtype=tf.float32):
-  """Generates a random left stochastic matrix."""
-  mat_shape = (dim, dim) if num_cols is None else (dim, num_cols)
-  mat = tf.random.uniform(shape=mat_shape, dtype=dtype)
-  mat /= tf.norm(mat, ord=1, axis=0, keepdims=True)
-  return mat
+    return self.network_type(q_heads, unordered_q_heads, q_values)
